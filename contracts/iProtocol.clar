@@ -109,6 +109,47 @@
       (print { event: "claim-rejected", claimant: claimant, claim-amount: claim-amount, reason: reason })
       (ok true))))
 
+;; Function to check and expire a single claim
+(define-public (check-and-expire-claim (claimant principal) (claim-amount uint))
+  (let (
+    (claim-key { claimant: claimant, amount: claim-amount })
+    (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_CLAIM_NOT_FOUND))
+  )
+    (if (and (is-eq (get status claim-data) "pending")
+             (>= (- block-height (get timestamp claim-data)) CLAIM_EXPIRATION_PERIOD))
+        (begin
+          (map-set insurance-claims claim-key { 
+            status: "expired", 
+            timestamp: (get timestamp claim-data), 
+            paid-amount: u0, 
+            evidence-hash: (get evidence-hash claim-data) 
+          })
+          (print { event: "claim-expired", claimant: claimant, claim-amount: claim-amount })
+          (ok true))
+        (ok false))))
+
+;; Function to change the contract owner
+(define-public (change-contract-owner (new-owner principal))
+  (begin
+    (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq new-owner 'SP000000000000000000002Q6VF78)) ERR_INVALID_PRINCIPAL)
+    (print { event: "contract-owner-changed", old-owner: (var-get contract-owner), new-owner: new-owner })
+    (ok (var-set contract-owner new-owner))))
+
+;; Function to pause contract in emergency
+(define-public (set-contract-pause (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (ok (var-set contract-paused paused))))
+
+;; Function to set minimum coverage amount
+(define-public (set-minimum-coverage (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_ZERO_AMOUNT)
+    (print { event: "minimum-coverage-changed", old-minimum: (var-get minimum-coverage-amount), new-minimum: amount })
+    (ok (var-set minimum-coverage-amount amount))))
 
 ;; Function to calculate insurance premium based on amount and duration
 (define-read-only (calculate-premium (amount uint) (duration uint))
@@ -139,3 +180,37 @@
       remaining-blocks: (- (get expiry coverage) block-height)
     })
     ERR_NOT_INSURED))
+
+;; Function to get the claim status
+(define-read-only (get-claim-status (claimant principal) (claim-amount uint))
+  (match (map-get? insurance-claims { claimant: claimant, amount: claim-amount })
+    claim-data (ok { 
+      status: (get status claim-data), 
+      timestamp: (get timestamp claim-data), 
+      paid-amount: (get paid-amount claim-data),
+      evidence-hash: (get evidence-hash claim-data)
+    })
+    ERR_CLAIM_NOT_FOUND))
+
+;; Function to get all pending claims for an entity
+(define-read-only (get-pending-claims (entity principal))
+  (ok {
+    entity: entity,
+    coverage: (map-get? insured-entities entity),
+    has-coverage: (is-some (map-get? insured-entities entity)),
+    pending-claim: (map-get? insurance-claims { 
+      claimant: entity, 
+      amount: (get coverage-amount (default-to { coverage-amount: u0, expiry: u0 } (map-get? insured-entities entity))) 
+    })
+  }))
+
+;; Function to get contract statistics
+(define-read-only (get-contract-stats)
+  (ok {
+    pool-balance: (var-get insurance-pool),
+    is-paused: (var-get contract-paused),
+    owner: (var-get contract-owner),
+    minimum-coverage: (var-get minimum-coverage-amount),
+    claim-expiration-period: CLAIM_EXPIRATION_PERIOD,
+    standard-coverage-period: STANDARD_COVERAGE_PERIOD
+  }))
