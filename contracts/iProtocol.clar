@@ -17,6 +17,8 @@
 (define-constant ERR_PREMIUM_CALCULATION_FAILED (err u113))
 (define-constant ERR_COVERAGE_PERIOD_EXPIRED (err u114))
 (define-constant ERR_MINIMUM_COVERAGE_NOT_MET (err u115))
+(define-constant ERR_INVALID_HASH_SIZE (err u116))
+(define-constant ERR_INVALID_CLAIMANT (err u117))
 
 ;; Define the contract
 (define-data-var insurance-pool uint u0)
@@ -45,6 +47,16 @@
 ;; Helper function to check if coverage is still valid
 (define-private (is-coverage-valid (expiry uint))
   (<= block-height expiry))
+
+;; Helper function to validate principal is not the zero address
+(define-private (is-valid-principal (address principal))
+  (not (is-eq address 'SP000000000000000000002Q6VF78)))
+
+;; Helper function to validate evidence hash (if provided)
+(define-private (is-valid-evidence-hash (hash (optional (buff 32))))
+  (match hash
+    evidence-data (is-eq (len evidence-data) u32)
+    true))
 
 ;; Function to purchase insurance coverage
 (define-public (purchase-coverage (amount uint) (period uint))
@@ -150,7 +162,11 @@
       (asserts! (is-coverage-valid coverage-expiry) ERR_COVERAGE_PERIOD_EXPIRED)
       (asserts! (<= claim-amount coverage-amount) ERR_CLAIM_EXCEEDS_COVERAGE)
       (asserts! (is-none (map-get? insurance-claims { claimant: caller, amount: claim-amount })) ERR_CLAIM_ALREADY_PROCESSED)
-      (map-set insurance-claims { claimant: caller, amount: claim-amount } { status: "pending", timestamp: block-height, paid-amount: u0, evidence-hash: evidence-hash })
+      ;; Validate evidence hash if provided
+      (asserts! (is-valid-evidence-hash evidence-hash) ERR_INVALID_HASH_SIZE)
+      ;; Store claim with validated evidence hash
+      (map-set insurance-claims { claimant: caller, amount: claim-amount } 
+               { status: "pending", timestamp: block-height, paid-amount: u0, evidence-hash: evidence-hash })
       (print { event: "claim-filed", claimant: caller, claim-amount: claim-amount, timestamp: block-height, evidence-hash: evidence-hash })
       (ok true))))
 
@@ -158,6 +174,8 @@
 (define-public (approve-claim (claimant principal) (claim-amount uint))
   (begin
     (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    ;; Validate claimant principal
+    (asserts! (is-valid-principal claimant) ERR_INVALID_PRINCIPAL)
     (let (
       (claim-key { claimant: claimant, amount: claim-amount })
       (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_CLAIM_NOT_FOUND))
@@ -171,6 +189,7 @@
       (asserts! (<= claim-amount coverage-amount) ERR_CLAIM_EXCEEDS_COVERAGE)
       (asserts! (< (- block-height (get timestamp claim-data)) CLAIM_EXPIRATION_PERIOD) ERR_CLAIM_NOT_EXPIRED)
       (let ((payout-amount (calculate-payout-amount claim-amount pool-balance)))
+        ;; Transfer funds using already validated claimant principal
         (match (as-contract (stx-transfer? payout-amount tx-sender claimant))
           success (begin
             (var-set insurance-pool (- pool-balance payout-amount))
@@ -183,6 +202,7 @@
                 })
                 (begin
                   (map-delete insurance-claims claim-key)
+                  ;; Safe to delete using validated claimant
                   (map-delete insured-entities claimant)))
             (print { event: "claim-approved", claimant: claimant, claim-amount: claim-amount, payout-amount: payout-amount })
             (ok payout-amount))
@@ -192,6 +212,8 @@
 (define-public (reject-claim (claimant principal) (claim-amount uint) (reason (string-ascii 100)))
   (begin
     (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    ;; Validate claimant principal
+    (asserts! (is-valid-principal claimant) ERR_INVALID_PRINCIPAL)
     (let (
       (claim-key { claimant: claimant, amount: claim-amount })
       (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_CLAIM_NOT_FOUND))
@@ -210,29 +232,32 @@
 
 ;; Function to check and expire a single claim
 (define-public (check-and-expire-claim (claimant principal) (claim-amount uint))
-  (let (
-    (claim-key { claimant: claimant, amount: claim-amount })
-    (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_CLAIM_NOT_FOUND))
-  )
-    (if (and (is-eq (get status claim-data) "pending")
-             (>= (- block-height (get timestamp claim-data)) CLAIM_EXPIRATION_PERIOD))
-        (begin
-          (map-set insurance-claims claim-key { 
-            status: "expired", 
-            timestamp: (get timestamp claim-data), 
-            paid-amount: u0, 
-            evidence-hash: (get evidence-hash claim-data) 
-          })
-          (print { event: "claim-expired", claimant: claimant, claim-amount: claim-amount })
-          (ok true))
-        (ok false))))
+  (begin
+    ;; Validate claimant principal
+    (asserts! (is-valid-principal claimant) ERR_INVALID_PRINCIPAL)
+    (let (
+      (claim-key { claimant: claimant, amount: claim-amount })
+      (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_CLAIM_NOT_FOUND))
+    )
+      (if (and (is-eq (get status claim-data) "pending")
+               (>= (- block-height (get timestamp claim-data)) CLAIM_EXPIRATION_PERIOD))
+          (begin
+            (map-set insurance-claims claim-key { 
+              status: "expired", 
+              timestamp: (get timestamp claim-data), 
+              paid-amount: u0, 
+              evidence-hash: (get evidence-hash claim-data) 
+            })
+            (print { event: "claim-expired", claimant: claimant, claim-amount: claim-amount })
+            (ok true))
+          (ok false)))))
 
 ;; Function to change the contract owner
 (define-public (change-contract-owner (new-owner principal))
   (begin
     (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
-    (asserts! (not (is-eq new-owner 'SP000000000000000000002Q6VF78)) ERR_INVALID_PRINCIPAL)
+    (asserts! (is-valid-principal new-owner) ERR_INVALID_PRINCIPAL)
     (print { event: "contract-owner-changed", old-owner: (var-get contract-owner), new-owner: new-owner })
     (ok (var-set contract-owner new-owner))))
 
