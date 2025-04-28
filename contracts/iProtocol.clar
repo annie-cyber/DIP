@@ -67,6 +67,28 @@
           (ok true))
         error (err error)))))
 
+;; Function to increase existing coverage amount
+(define-public (increase-coverage (additional-amount uint))
+  (begin
+    (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    (let (
+      (caller tx-sender)
+      (current-coverage (unwrap! (map-get? insured-entities caller) ERR_NOT_INSURED))
+      (current-amount (get coverage-amount current-coverage))
+      (current-expiry (get expiry current-coverage))
+      (remaining-blocks (- current-expiry block-height))
+      (premium (unwrap! (calculate-premium additional-amount remaining-blocks) ERR_PREMIUM_CALCULATION_FAILED))
+    )
+      (asserts! (> additional-amount u0) ERR_ZERO_AMOUNT)
+      (asserts! (is-coverage-valid current-expiry) ERR_COVERAGE_PERIOD_EXPIRED)
+      (match (stx-transfer? premium caller (as-contract tx-sender))
+        success (begin
+          (var-set insurance-pool (+ (var-get insurance-pool) premium))
+          (map-set insured-entities caller { coverage-amount: (+ current-amount additional-amount), expiry: current-expiry })
+          (print { event: "coverage-increased", additional-amount: additional-amount, new-total: (+ current-amount additional-amount), premium: premium, buyer: caller })
+          (ok true))
+        error (err error)))))
+
 ;; Function to extend coverage period
 (define-public (extend-coverage-period (additional-period uint))
   (begin
@@ -88,6 +110,83 @@
           (ok true))
         error (err error)))))
 
+;; Function to cancel coverage and receive partial refund based on remaining time
+(define-public (cancel-coverage)
+  (begin
+    (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    (let (
+      (caller tx-sender)
+      (current-coverage (unwrap! (map-get? insured-entities caller) ERR_NOT_INSURED))
+      (current-amount (get coverage-amount current-coverage))
+      (current-expiry (get expiry current-coverage))
+      (remaining-blocks (- current-expiry block-height))
+      (total-period STANDARD_COVERAGE_PERIOD)
+      (refund-rate (/ (* remaining-blocks u100) total-period)) ;; Calculate percentage of time remaining
+      (premium (unwrap! (calculate-premium current-amount total-period) ERR_PREMIUM_CALCULATION_FAILED))
+      (refund-amount (/ (* premium refund-rate) u100))
+    )
+      (asserts! (is-coverage-valid current-expiry) ERR_COVERAGE_PERIOD_EXPIRED)
+      ;; Check for any pending claims
+      (asserts! (is-none (map-get? insurance-claims { claimant: caller, amount: current-amount })) ERR_CLAIM_ALREADY_PROCESSED)
+      (match (as-contract (stx-transfer? refund-amount tx-sender caller))
+        success (begin
+          (var-set insurance-pool (- (var-get insurance-pool) refund-amount))
+          (map-delete insured-entities caller)
+          (print { event: "coverage-cancelled", coverage-amount: current-amount, refund-amount: refund-amount, owner: caller })
+          (ok refund-amount))
+        error (err error)))))
+
+;; Function to file an insurance claim with optional evidence hash
+(define-public (file-claim (claim-amount uint) (evidence-hash (optional (buff 32))))
+  (begin
+    (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    (let (
+      (caller tx-sender)
+      (coverage-data (unwrap! (map-get? insured-entities caller) ERR_NOT_INSURED))
+      (coverage-amount (get coverage-amount coverage-data))
+      (coverage-expiry (get expiry coverage-data))
+    )
+      (asserts! (> claim-amount u0) ERR_ZERO_AMOUNT)
+      (asserts! (is-coverage-valid coverage-expiry) ERR_COVERAGE_PERIOD_EXPIRED)
+      (asserts! (<= claim-amount coverage-amount) ERR_CLAIM_EXCEEDS_COVERAGE)
+      (asserts! (is-none (map-get? insurance-claims { claimant: caller, amount: claim-amount })) ERR_CLAIM_ALREADY_PROCESSED)
+      (map-set insurance-claims { claimant: caller, amount: claim-amount } { status: "pending", timestamp: block-height, paid-amount: u0, evidence-hash: evidence-hash })
+      (print { event: "claim-filed", claimant: caller, claim-amount: claim-amount, timestamp: block-height, evidence-hash: evidence-hash })
+      (ok true))))
+
+;; Function to approve and pay out a claim
+(define-public (approve-claim (claimant principal) (claim-amount uint))
+  (begin
+    (asserts! (contract-not-paused) ERR_CONTRACT_PAUSED)
+    (let (
+      (claim-key { claimant: claimant, amount: claim-amount })
+      (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_CLAIM_NOT_FOUND))
+      (pool-balance (var-get insurance-pool))
+      (coverage-data (unwrap! (map-get? insured-entities claimant) ERR_NOT_INSURED))
+      (coverage-amount (get coverage-amount coverage-data))
+    )
+      (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+      (asserts! (is-eq (get status claim-data) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+      (asserts! (> pool-balance u0) ERR_POOL_EMPTY)
+      (asserts! (<= claim-amount coverage-amount) ERR_CLAIM_EXCEEDS_COVERAGE)
+      (asserts! (< (- block-height (get timestamp claim-data)) CLAIM_EXPIRATION_PERIOD) ERR_CLAIM_NOT_EXPIRED)
+      (let ((payout-amount (calculate-payout-amount claim-amount pool-balance)))
+        (match (as-contract (stx-transfer? payout-amount tx-sender claimant))
+          success (begin
+            (var-set insurance-pool (- pool-balance payout-amount))
+            (if (< payout-amount claim-amount)
+                (map-set insurance-claims claim-key { 
+                  status: "partially-paid", 
+                  timestamp: block-height, 
+                  paid-amount: payout-amount, 
+                  evidence-hash: (get evidence-hash claim-data) 
+                })
+                (begin
+                  (map-delete insurance-claims claim-key)
+                  (map-delete insured-entities claimant)))
+            (print { event: "claim-approved", claimant: claimant, claim-amount: claim-amount, payout-amount: payout-amount })
+            (ok payout-amount))
+          error (err error))))))
 
 ;; Function to reject a claim
 (define-public (reject-claim (claimant principal) (claim-amount uint) (reason (string-ascii 100)))
